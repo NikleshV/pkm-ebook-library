@@ -30,8 +30,43 @@ SKIP_DIRS = {".caltrash"}
 PDF_PAGES_PER_CHUNK = 20
 MAX_TITLE_LENGTH = 80
 
+# Characters outside Basic Latin + Latin Extended are considered non-Latin.
+# Used to detect non-English filenames and text content.
+NON_LATIN_THRESHOLD_FILENAME = 0.3   # 30% non-Latin chars in filename → skip
+NON_LATIN_THRESHOLD_TEXT = 0.25      # 25% non-Latin chars in extracted text → skip
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _non_latin_ratio(text: str) -> float:
+    """Return the fraction of alphabetic characters that are outside Latin scripts."""
+    alpha_chars = [ch for ch in text if ch.isalpha()]
+    if not alpha_chars:
+        return 0.0
+    non_latin = sum(
+        1 for ch in alpha_chars
+        if unicodedata.category(ch).startswith("L")
+        and not ("\u0000" <= ch <= "\u024F")  # Basic Latin + Latin Extended A/B
+    )
+    return non_latin / len(alpha_chars)
+
+
+def is_non_english_filename(filepath: Path) -> bool:
+    """Check if the filename suggests non-English content."""
+    name = filepath.stem
+    return _non_latin_ratio(name) > NON_LATIN_THRESHOLD_FILENAME
+
+
+def is_non_english_text(text: str, sample_size: int = 2000) -> bool:
+    """Check if extracted text is predominantly non-English (non-Latin script)."""
+    # Sample from the middle of the text for a better signal
+    if len(text) > sample_size * 2:
+        mid = len(text) // 2
+        sample = text[mid - sample_size : mid + sample_size]
+    else:
+        sample = text
+    return _non_latin_ratio(sample) > NON_LATIN_THRESHOLD_TEXT
+
 
 def sanitise_title(name: str) -> str:
     """Convert a filename/title into a safe folder name."""
@@ -66,14 +101,18 @@ def setup_logging():
     return logger
 
 
-def find_books(root: Path):
-    """Yield all supported book files, skipping SKIP_DIRS."""
+def find_books(root: Path, logger: logging.Logger = None):
+    """Yield all supported book files, skipping SKIP_DIRS and non-English filenames."""
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
         if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        if is_non_english_filename(path):
+            if logger:
+                logger.info("SKIP (non-English filename): %s", path.name)
             continue
         yield path
 
@@ -256,6 +295,12 @@ def process_book(filepath: Path, logger: logging.Logger) -> str:
         logger.warning("EMPTY (no text extracted): %s", filepath.name)
         return "fail"
 
+    # Check if extracted text is non-English
+    combined_sample = " ".join(ch["text"] for ch in chapters[:3])  # sample first 3 chapters
+    if is_non_english_text(combined_sample):
+        logger.info("SKIP (non-English text content): %s", filepath.name)
+        return "skip_lang"
+
     # Save chapters
     book_dir.mkdir(parents=True, exist_ok=True)
     for ch in chapters:
@@ -284,12 +329,13 @@ def main():
 
     CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
-    book_files = list(find_books(LIBRARY_DIR))
+    book_files = list(find_books(LIBRARY_DIR, logger))
     total = len(book_files)
-    logger.info("Found %d book files to process", total)
+    logger.info("Found %d book files to process (after filename language filter)", total)
 
     success = 0
     skipped = 0
+    skipped_lang = 0
     failed = 0
 
     for filepath in tqdm(book_files, desc="Extracting", unit="book"):
@@ -298,13 +344,17 @@ def main():
             success += 1
         elif result == "skip":
             skipped += 1
+        elif result == "skip_lang":
+            skipped_lang += 1
         else:
             failed += 1
 
     logger.info("-" * 60)
-    logger.info("Done. Total: %d | Extracted: %d | Skipped: %d | Failed: %d",
-                total, success, skipped, failed)
-    print(f"\nDone! Extracted: {success} | Skipped: {skipped} | Failed: {failed}")
+    logger.info("Done. Total: %d | Extracted: %d | Skipped (done): %d | "
+                "Skipped (non-English): %d | Failed: %d",
+                total, success, skipped, skipped_lang, failed)
+    print(f"\nDone! Extracted: {success} | Skipped (done): {skipped} | "
+          f"Skipped (non-English): {skipped_lang} | Failed: {failed}")
 
 
 if __name__ == "__main__":
