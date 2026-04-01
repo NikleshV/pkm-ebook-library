@@ -1,12 +1,16 @@
 """
-05_generate_notes.py — Generate structured Obsidian notes for each book via Claude API.
+05_generate_notes.py — Generate structured Obsidian notes for each book.
 
-Reads extracted chapter text from PKM-Index/chunks/, sends to Claude
-(claude-sonnet-4-20250514) with a knowledge-extraction prompt, and saves the
-resulting markdown note to the Obsidian vault. Idempotent: skips books
-whose note already exists. Requires ANTHROPIC_API_KEY environment variable.
+Default: uses Ollama (llama3.1:8b) running locally — completely free.
+Optional: pass --claude flag to use Anthropic Claude API instead
+          (requires ANTHROPIC_API_KEY environment variable).
+
+Reads extracted chapter text from PKM-Index/chunks/, sends to the LLM
+with a knowledge-extraction prompt, and saves the resulting markdown note
+to the Obsidian vault. Idempotent: skips books whose note already exists.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -15,7 +19,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-import anthropic
+import requests
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 INDEX_DIR = Path(r"N:\Projects\PKM\PKM-Index")
@@ -27,15 +31,22 @@ OBSIDIAN_VAULT = Path(
 )
 NOTES_DIR = OBSIDIAN_VAULT / "PKM-Library" / "Books"
 
-MODEL = "claude-sonnet-4-20250514"
+# Ollama settings (default — free, local)
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "llama3.1:8b"
+
+# Claude settings (optional — paid)
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
 MAX_WORDS = 6000
-API_DELAY_SECONDS = 3
+API_DELAY_SECONDS = 1       # 1s for local Ollama, bumped to 3s for Claude
 MAX_TITLE_LENGTH = 80
 
 SYSTEM_PROMPT = (
     "You are a knowledge extraction assistant. Given the text of a book, "
     "generate a structured Obsidian markdown note. Output ONLY valid markdown "
-    "with YAML frontmatter. No preamble."
+    "with YAML frontmatter. No preamble, no explanation, no wrapping in "
+    "code fences. Start directly with the --- of the YAML frontmatter."
 )
 
 NOTE_TEMPLATE_INSTRUCTIONS = """\
@@ -80,9 +91,7 @@ that connect to this book's ideas)
 def sanitise_note_filename(name: str) -> str:
     """Convert a title into a safe filename for Obsidian (no path-illegal chars)."""
     name = unicodedata.normalize("NFKD", name)
-    # Remove characters illegal in Windows filenames
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
-    # Collapse runs of underscores/spaces
     name = re.sub(r"[\s_]+", " ", name).strip()
     return name[:MAX_TITLE_LENGTH]
 
@@ -140,8 +149,52 @@ def load_metadata(book_dir: Path) -> dict:
     }
 
 
-def generate_note(client: anthropic.Anthropic, metadata: dict, text: str) -> str:
-    """Call Claude API to generate the Obsidian note."""
+def clean_response(text: str) -> str:
+    """Strip any markdown code fences the model might wrap around the output."""
+    text = text.strip()
+    # Remove ```markdown ... ``` wrapping
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```markdown or ```)
+        lines = lines[1:]
+        # Remove last line if it's ```
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
+# ── LLM Backends ──────────────────────────────────────────────────────────────
+
+def generate_note_ollama(metadata: dict, text: str) -> str:
+    """Generate note via Ollama (local, free)."""
+    user_prompt = (
+        f"Book metadata: {json.dumps(metadata, ensure_ascii=False)}\n\n"
+        f"Book text sample:\n{text}\n\n"
+        f"{NOTE_TEMPLATE_INSTRUCTIONS}"
+    )
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "num_predict": 2000,
+            "temperature": 0.3,
+        },
+    }
+
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    resp.raise_for_status()
+    content = resp.json()["message"]["content"]
+    return clean_response(content)
+
+
+def generate_note_claude(client, metadata: dict, text: str) -> str:
+    """Generate note via Anthropic Claude API (paid)."""
     user_prompt = (
         f"Book metadata: {json.dumps(metadata, ensure_ascii=False)}\n\n"
         f"Book text sample:\n{text}\n\n"
@@ -149,32 +202,72 @@ def generate_note(client: anthropic.Anthropic, metadata: dict, text: str) -> str
     )
 
     response = client.messages.create(
-        model=MODEL,
+        model=CLAUDE_MODEL,
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    return response.content[0].text
+    return clean_response(response.content[0].text)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Generate Obsidian notes from extracted book text."
+    )
+    parser.add_argument(
+        "--claude", action="store_true",
+        help="Use Anthropic Claude API instead of local Ollama (requires ANTHROPIC_API_KEY)"
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help=f"Override the model name (default: {OLLAMA_MODEL} for Ollama, "
+             f"{CLAUDE_MODEL} for Claude)"
+    )
+    args = parser.parse_args()
+
     logger = setup_logging()
     logger.info("=" * 60)
+
+    # ── Select backend ─────────────────────────────────────────────────────
+    use_claude = args.claude
+    claude_client = None
+
+    if use_claude:
+        import anthropic
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            logger.error("ANTHROPIC_API_KEY environment variable not set.")
+            print("ERROR: Set ANTHROPIC_API_KEY before running with --claude.")
+            print("  Windows:  set ANTHROPIC_API_KEY=sk-ant-...")
+            print("  Or:       $env:ANTHROPIC_API_KEY = 'sk-ant-...'  (PowerShell)")
+            return
+        claude_client = anthropic.Anthropic(api_key=api_key)
+        model_name = args.model or CLAUDE_MODEL
+        delay = 3
+        logger.info("Backend: Claude API (%s)", model_name)
+    else:
+        # Verify Ollama is running
+        model_name = args.model or OLLAMA_MODEL
+        try:
+            r = requests.get("http://localhost:11434/api/tags", timeout=5)
+            r.raise_for_status()
+            available = [m["name"] for m in r.json().get("models", [])]
+            if model_name not in available and f"{model_name}:latest" not in available:
+                print(f"WARNING: Model '{model_name}' not found in Ollama.")
+                print(f"  Available: {', '.join(available)}")
+                print(f"  Run: ollama pull {model_name}")
+                return
+        except requests.ConnectionError:
+            print("ERROR: Cannot connect to Ollama at localhost:11434")
+            print("  Make sure Ollama is running: ollama serve")
+            return
+        delay = 1
+        logger.info("Backend: Ollama local (%s) — FREE", model_name)
+
     logger.info("Starting Obsidian note generation")
-
-    # Check API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.error("ANTHROPIC_API_KEY environment variable not set.")
-        print("ERROR: Set ANTHROPIC_API_KEY before running this script.")
-        print("  Windows:  set ANTHROPIC_API_KEY=sk-ant-...")
-        print("  Or:       $env:ANTHROPIC_API_KEY = 'sk-ant-...'  (PowerShell)")
-        return
-
-    client = anthropic.Anthropic(api_key=api_key)
 
     # Create output directory
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
@@ -213,19 +306,19 @@ def main():
             continue
 
         try:
-            note_content = generate_note(client, metadata, text)
+            if use_claude:
+                note_content = generate_note_claude(claude_client, metadata, text)
+            else:
+                note_content = generate_note_ollama(metadata, text)
+
             note_path.write_text(note_content, encoding="utf-8")
             logger.info("OK: %s", title)
             success += 1
-        except anthropic.APIError as e:
-            logger.error("FAIL (API error): %s — %s", title, e)
-            failed += 1
         except Exception as e:
             logger.error("FAIL: %s — %s", title, e)
             failed += 1
 
-        # Rate limit delay
-        time.sleep(API_DELAY_SECONDS)
+        time.sleep(delay)
 
     logger.info("-" * 60)
     logger.info("Done. Total: %d | Generated: %d | Skipped: %d | Failed: %d",
