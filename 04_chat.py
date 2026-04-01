@@ -18,7 +18,7 @@ CHROMA_DIR = INDEX_DIR / "chroma"
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 COLLECTION_NAME = "pkm_books"
-TOP_K = 8
+TOP_K = 20
 PREVIEW_CHARS = 400
 
 
@@ -100,7 +100,7 @@ def main():
         for doc, meta, dist in zip(documents, metadatas, distances):
             book = meta.get("book_title", "")
             seen_books[book] = seen_books.get(book, 0) + 1
-            if seen_books[book] > 2:
+            if seen_books[book] > 5:
                 continue
             displayed += 1
             print(format_result(displayed, doc, meta, dist))
