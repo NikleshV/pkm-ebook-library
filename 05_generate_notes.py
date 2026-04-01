@@ -34,13 +34,17 @@ NOTES_DIR = OBSIDIAN_VAULT / "PKM-Library" / "Books"
 # Ollama settings (default — free, local)
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.1:8b"
+OLLAMA_TIMEOUT = 600        # 10 min — generous for slow CPUs
+OLLAMA_NUM_CTX = 8192       # Explicit context window (input + output tokens)
+OLLAMA_MAX_WORDS = 2500     # ~3,300 tokens input — fits comfortably in 8k ctx
 
 # Claude settings (optional — paid)
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MAX_WORDS = 6000     # Claude has huge context, no issue
 
-MAX_WORDS = 6000
 API_DELAY_SECONDS = 1       # 1s for local Ollama, bumped to 3s for Claude
 MAX_TITLE_LENGTH = 80
+# (MAX_WORDS is now per-backend: OLLAMA_MAX_WORDS / CLAUDE_MAX_WORDS)
 
 SYSTEM_PROMPT = (
     "You are a knowledge extraction assistant. Given the text of a book, "
@@ -115,8 +119,8 @@ def setup_logging():
     return logger
 
 
-def load_book_text(book_dir: Path) -> str:
-    """Concatenate all chapter .txt files, truncated to MAX_WORDS."""
+def load_book_text(book_dir: Path, max_words: int) -> str:
+    """Concatenate all chapter .txt files, truncated to max_words."""
     txt_files = sorted(book_dir.glob("*.txt"))
     parts = []
     word_count = 0
@@ -124,7 +128,7 @@ def load_book_text(book_dir: Path) -> str:
     for txt_file in txt_files:
         text = txt_file.read_text(encoding="utf-8", errors="replace")
         words = text.split()
-        remaining = MAX_WORDS - word_count
+        remaining = max_words - word_count
         if remaining <= 0:
             break
         parts.append(" ".join(words[:remaining]))
@@ -183,11 +187,12 @@ def generate_note_ollama(metadata: dict, text: str) -> str:
         "stream": False,
         "options": {
             "num_predict": 2000,
+            "num_ctx": OLLAMA_NUM_CTX,   # explicit context window
             "temperature": 0.3,
         },
     }
 
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
     resp.raise_for_status()
     content = resp.json()["message"]["content"]
     return clean_response(content)
@@ -299,7 +304,8 @@ def main():
 
         print(f"[{i}/{total}] {title[:60]}")
 
-        text = load_book_text(book_dir)
+        max_words = CLAUDE_MAX_WORDS if use_claude else OLLAMA_MAX_WORDS
+        text = load_book_text(book_dir, max_words)
         if len(text.strip()) < 100:
             logger.warning("SKIP (too little text): %s", title)
             skipped += 1
