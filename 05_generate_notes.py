@@ -34,13 +34,13 @@ NOTES_DIR = OBSIDIAN_VAULT / "PKM-Library" / "Books"
 # Ollama settings (default — free, local)
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.1:8b"
-OLLAMA_TIMEOUT = 600        # 10 min — generous for slow CPUs
-OLLAMA_NUM_CTX = 8192       # Explicit context window (input + output tokens)
-OLLAMA_MAX_WORDS = 2500     # ~3,300 tokens input — fits comfortably in 8k ctx
+OLLAMA_TIMEOUT = 600        # 10 min — generous safety net
+OLLAMA_NUM_CTX = 16384      # 16k context — 6k words in + 2k out, with headroom
+OLLAMA_MAX_WORDS = 6000     # ~8,000 tokens — same as Claude now
 
 # Claude settings (optional — paid)
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-CLAUDE_MAX_WORDS = 6000     # Claude has huge context, no issue
+CLAUDE_MAX_WORDS = 6000
 
 API_DELAY_SECONDS = 1       # 1s for local Ollama, bumped to 3s for Claude
 MAX_TITLE_LENGTH = 80
