@@ -1,0 +1,20 @@
+# Data directories (large, generated)
+PKM-Index/chunks/
+PKM-Index/chroma/
+PKM-Index/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini

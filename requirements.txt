@@ -1,0 +1,11 @@
+# PKM Ebook Library — Dependencies
+# Install: pip install -r requirements.txt
+
+PyMuPDF>=1.24.0          # PDF text extraction (import fitz)
+ebooklib>=0.18           # EPUB parsing
+python-docx>=1.1.0       # DOCX parsing
+sentence-transformers>=3.0.0  # Local embeddings (all-MiniLM-L6-v2)
+chromadb>=0.5.0          # Vector store
+tqdm>=4.66.0             # Progress bars
+pyyaml>=6.0              # YAML config/metadata
+anthropic>=0.39.0        # Claude API (Phase 2 — note generation)
