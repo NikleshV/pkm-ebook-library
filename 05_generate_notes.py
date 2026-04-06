@@ -1,18 +1,21 @@
 """
-05_generate_notes.py — Generate structured Obsidian notes for each book.
+05_generate_notes.py — Generate detailed structured Obsidian notes for each book.
 
 Default: uses Ollama (llama3.1:8b) running locally — completely free.
 Optional: pass --claude flag to use Anthropic Claude API instead
           (requires ANTHROPIC_API_KEY environment variable).
 
-Reads extracted chapter text from PKM-Index/chunks/, sends to the LLM
-with a knowledge-extraction prompt, and saves the resulting markdown note
-to the Obsidian vault. Idempotent: skips books whose note already exists.
+Features:
+  - Chapter-by-chapter notes with per-chapter key points
+  - Within-book linkages mapped as [[wikilinks]] across chapters
+  - Batch processing: --batch N --batch-size 300 to process in chunks
+  - Idempotent: skips books whose note already exists
 """
 
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -34,66 +37,97 @@ NOTES_DIR = OBSIDIAN_VAULT / "PKM-Library" / "Books"
 # Ollama settings (default — free, local)
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.1:8b"
-OLLAMA_TIMEOUT = 600        # 10 min — generous safety net
-OLLAMA_NUM_CTX = 16384      # 16k context — 6k words in + 2k out, with headroom
-OLLAMA_MAX_WORDS = 6000     # ~8,000 tokens — same as Claude now
+OLLAMA_TIMEOUT = 600        # 10 min safety net
+OLLAMA_NUM_CTX = 16384      # 16k context window
+OLLAMA_MAX_WORDS = 6000     # distributed evenly across chapters
+OLLAMA_MAX_OUTPUT = 4000    # tokens — detailed notes need more room
 
 # Claude settings (optional — paid)
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MAX_WORDS = 6000
+CLAUDE_MAX_OUTPUT = 4000
 
-API_DELAY_SECONDS = 1       # 1s for local Ollama, bumped to 3s for Claude
+# Words per chapter sample when distributing budget across chapters
+WORDS_PER_CHAPTER = 400     # ~530 tokens; keeps each chapter well-represented
+
+API_DELAY_SECONDS = 1       # 1s Ollama, 3s Claude
 MAX_TITLE_LENGTH = 80
-# (MAX_WORDS is now per-backend: OLLAMA_MAX_WORDS / CLAUDE_MAX_WORDS)
 
 SYSTEM_PROMPT = (
-    "You are a knowledge extraction assistant. Given the text of a book, "
-    "generate a structured Obsidian markdown note. Output ONLY valid markdown "
-    "with YAML frontmatter. No preamble, no explanation, no wrapping in "
-    "code fences. Start directly with the --- of the YAML frontmatter."
+    "You are a knowledge extraction assistant. Given the text of a book — "
+    "organised by chapter — generate a detailed, structured Obsidian markdown note. "
+    "Output ONLY valid markdown with YAML frontmatter. No preamble, no explanation, "
+    "no wrapping in code fences. Start directly with --- of the YAML frontmatter."
 )
 
 NOTE_TEMPLATE_INSTRUCTIONS = """\
-Generate an Obsidian markdown note with this exact structure:
+Generate a detailed Obsidian markdown note with this exact structure.
+Use [[wikilinks]] for every important concept, person, framework, or term
+that could link to another note. Be specific and substantive in every section.
 
 ---
 title: "{title}"
 author: "{author}"
 year: {year}
-tags: [tag1, tag2, tag3]  # 3-5 topic tags, lowercase, no hash symbols
+tags: [tag1, tag2, tag3]
 format: {format}
 read_status: "unread"
 anki_exported: false
+chapter_count: {chapter_count}
 ---
 
 # {title}
 
-## 30-Second Summary
-(2-3 sentences capturing the core thesis)
+## Overview
+(3-4 sentences: core thesis, who it is for, and why it matters)
 
-## Key Concepts
-(Bullet list of 5-10 key concepts. Use [[wikilinks]] for important concepts
-that could link to other notes, e.g. [[Systems Thinking]], [[Lean Manufacturing]])
+## Chapter Notes
+(For each chapter in the text, write a ### heading and 3-5 bullet points
+capturing the key ideas, arguments, or facts from that chapter.
+Use [[wikilinks]] for any concept worth linking. Example:
 
-## Key Arguments or Frameworks
-(Bullet list of the main arguments, models, or frameworks presented)
+### Chapter 1: <title or topic>
+- Key point introducing [[Core Concept]]
+- How [[Framework X]] is established here
+...
+
+### Chapter 2: <title or topic>
+- ...
+)
+
+## Cross-Chapter Themes
+(Bullet list of recurring themes or concepts that appear across multiple chapters.
+For each, note WHICH chapters it appears in and use [[wikilinks]].
+Example:
+- [[Systems Thinking]] — central to Chapters 1, 3, and 5; evolves from intro to application
+)
+
+## Key Frameworks or Models
+(Bullet list of named frameworks, models, or step-by-step processes the author presents.
+Give each a [[wikilink]] and a one-line description.)
+
+## Within-Book Linkages
+(Map how ideas BUILD on each other across the book.
+Example:
+- The [[OODA Loop]] introduced in Ch.2 is applied to [[Decision Making Under Uncertainty]] in Ch.6
+- [[Scarcity Mindset]] (Ch.1) contrasts with [[Abundance Mindset]] (Ch.4), resolved in Ch.7
+)
 
 ## Notable Quotes
-(2-3 maximum, each under 15 words, formatted as blockquotes)
+(3-5 quotes, each under 20 words, as blockquotes. Note chapter if known.)
 
-## Connections
-(Bullet list using [[wikilinks]] to related concepts, fields, or thinkers
-that connect to this book's ideas)
+## Connections to Other Works
+([[wikilinks]] to related books, thinkers, or fields that connect to this book's ideas)
 
 ## Open Questions
-(2-3 questions this book raises or leaves unanswered)
+(3-5 questions this book raises, leaves unanswered, or that deserve follow-up)
 """
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def sanitise_note_filename(name: str) -> str:
-    """Convert a title into a safe filename for Obsidian (no path-illegal chars)."""
+    """Convert a title into a safe filename for Obsidian."""
     name = unicodedata.normalize("NFKD", name)
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = re.sub(r"[\s_]+", " ", name).strip()
@@ -111,7 +145,6 @@ def setup_logging():
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s"))
         logger.addHandler(fh)
-
         ch = logging.StreamHandler()
         ch.setFormatter(logging.Formatter("%(levelname)-7s  %(message)s"))
         logger.addHandler(ch)
@@ -119,26 +152,44 @@ def setup_logging():
     return logger
 
 
-def load_book_text(book_dir: Path, max_words: int) -> str:
-    """Concatenate all chapter .txt files, truncated to max_words."""
+def load_chapters(book_dir: Path, max_words: int) -> list[dict]:
+    """
+    Load each chapter .txt file as a separate dict {name, text}.
+    Distributes the word budget evenly across all chapters so every
+    chapter is represented rather than front-loading early chapters.
+    """
     txt_files = sorted(book_dir.glob("*.txt"))
-    parts = []
-    word_count = 0
+    if not txt_files:
+        return []
 
+    n_chapters = len(txt_files)
+    # Each chapter gets an equal share, capped at WORDS_PER_CHAPTER
+    words_each = min(WORDS_PER_CHAPTER, max_words // n_chapters)
+
+    chapters = []
     for txt_file in txt_files:
-        text = txt_file.read_text(encoding="utf-8", errors="replace")
-        words = text.split()
-        remaining = max_words - word_count
-        if remaining <= 0:
-            break
-        parts.append(" ".join(words[:remaining]))
-        word_count += min(len(words), remaining)
+        raw = txt_file.read_text(encoding="utf-8", errors="replace")
+        words = raw.split()
+        snippet = " ".join(words[:words_each])
+        if len(snippet.strip()) < 30:
+            continue
+        chapters.append({
+            "name": txt_file.stem,       # e.g. "chapter_001" or "section_002_pages_21_to_40"
+            "text": snippet,
+        })
 
+    return chapters
+
+
+def format_chapters_for_prompt(chapters: list[dict]) -> str:
+    """Format chapter list into a clearly delimited string for the prompt."""
+    parts = []
+    for i, ch in enumerate(chapters, 1):
+        parts.append(f"=== Chapter {i} ({ch['name']}) ===\n{ch['text']}")
     return "\n\n".join(parts)
 
 
 def load_metadata(book_dir: Path) -> dict:
-    """Load metadata.json for a book."""
     meta_file = book_dir / "metadata.json"
     if meta_file.exists():
         try:
@@ -150,69 +201,62 @@ def load_metadata(book_dir: Path) -> dict:
         "author": "Unknown",
         "year": "Unknown",
         "format": "unknown",
+        "chapter_count": 0,
     }
 
 
 def clean_response(text: str) -> str:
-    """Strip any markdown code fences the model might wrap around the output."""
+    """Strip markdown code fences the model might wrap around output."""
     text = text.strip()
-    # Remove ```markdown ... ``` wrapping
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first line (```markdown or ```)
         lines = lines[1:]
-        # Remove last line if it's ```
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines)
     return text.strip()
 
 
-# ── LLM Backends ──────────────────────────────────────────────────────────────
-
-def generate_note_ollama(metadata: dict, text: str) -> str:
-    """Generate note via Ollama (local, free)."""
-    user_prompt = (
+def build_user_prompt(metadata: dict, chapters: list[dict]) -> str:
+    chapter_text = format_chapters_for_prompt(chapters)
+    return (
         f"Book metadata: {json.dumps(metadata, ensure_ascii=False)}\n\n"
-        f"Book text sample:\n{text}\n\n"
+        f"Book text (by chapter):\n{chapter_text}\n\n"
         f"{NOTE_TEMPLATE_INSTRUCTIONS}"
     )
 
+
+# ── LLM Backends ──────────────────────────────────────────────────────────────
+
+def generate_note_ollama(metadata: dict, chapters: list[dict]) -> str:
+    """Generate note via Ollama (local, free)."""
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": build_user_prompt(metadata, chapters)},
         ],
         "stream": False,
         "options": {
-            "num_predict": 2000,
-            "num_ctx": OLLAMA_NUM_CTX,   # explicit context window
+            "num_predict": OLLAMA_MAX_OUTPUT,
+            "num_ctx": OLLAMA_NUM_CTX,
             "temperature": 0.3,
         },
     }
 
     resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
     resp.raise_for_status()
-    content = resp.json()["message"]["content"]
-    return clean_response(content)
+    return clean_response(resp.json()["message"]["content"])
 
 
-def generate_note_claude(client, metadata: dict, text: str) -> str:
+def generate_note_claude(client, metadata: dict, chapters: list[dict]) -> str:
     """Generate note via Anthropic Claude API (paid)."""
-    user_prompt = (
-        f"Book metadata: {json.dumps(metadata, ensure_ascii=False)}\n\n"
-        f"Book text sample:\n{text}\n\n"
-        f"{NOTE_TEMPLATE_INSTRUCTIONS}"
-    )
-
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2000,
+        max_tokens=CLAUDE_MAX_OUTPUT,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
+        messages=[{"role": "user", "content": build_user_prompt(metadata, chapters)}],
     )
-
     return clean_response(response.content[0].text)
 
 
@@ -220,23 +264,30 @@ def generate_note_claude(client, metadata: dict, text: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate Obsidian notes from extracted book text."
+        description="Generate detailed Obsidian notes from extracted book text."
     )
     parser.add_argument(
         "--claude", action="store_true",
-        help="Use Anthropic Claude API instead of local Ollama (requires ANTHROPIC_API_KEY)"
+        help="Use Claude API instead of Ollama (requires ANTHROPIC_API_KEY)"
     )
     parser.add_argument(
         "--model", type=str, default=None,
-        help=f"Override the model name (default: {OLLAMA_MODEL} for Ollama, "
-             f"{CLAUDE_MODEL} for Claude)"
+        help="Override the model name"
+    )
+    parser.add_argument(
+        "--batch", type=int, default=None,
+        help="Which batch to process (1-indexed). Use with --batch-size."
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=300,
+        help="Number of books per batch (default: 300)"
     )
     args = parser.parse_args()
 
     logger = setup_logging()
     logger.info("=" * 60)
 
-    # ── Select backend ─────────────────────────────────────────────────────
+    # ── Select backend ─────────────────────────────────────────────
     use_claude = args.claude
     claude_client = None
 
@@ -244,18 +295,17 @@ def main():
         import anthropic
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
-            logger.error("ANTHROPIC_API_KEY environment variable not set.")
+            logger.error("ANTHROPIC_API_KEY not set.")
             print("ERROR: Set ANTHROPIC_API_KEY before running with --claude.")
-            print("  Windows:  set ANTHROPIC_API_KEY=sk-ant-...")
-            print("  Or:       $env:ANTHROPIC_API_KEY = 'sk-ant-...'  (PowerShell)")
             return
         claude_client = anthropic.Anthropic(api_key=api_key)
         model_name = args.model or CLAUDE_MODEL
+        max_words = CLAUDE_MAX_WORDS
         delay = 3
         logger.info("Backend: Claude API (%s)", model_name)
     else:
-        # Verify Ollama is running
         model_name = args.model or OLLAMA_MODEL
+        max_words = OLLAMA_MAX_WORDS
         try:
             r = requests.get("http://localhost:11434/api/tags", timeout=5)
             r.raise_for_status()
@@ -263,33 +313,53 @@ def main():
             if model_name not in available and f"{model_name}:latest" not in available:
                 print(f"WARNING: Model '{model_name}' not found in Ollama.")
                 print(f"  Available: {', '.join(available)}")
-                print(f"  Run: ollama pull {model_name}")
                 return
         except requests.ConnectionError:
             print("ERROR: Cannot connect to Ollama at localhost:11434")
-            print("  Make sure Ollama is running: ollama serve")
             return
         delay = 1
         logger.info("Backend: Ollama local (%s) — FREE", model_name)
 
-    logger.info("Starting Obsidian note generation")
-
     # Create output directory
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Output: %s", NOTES_DIR)
 
-    # Gather book folders
+    # Gather all book folders
     if not CHUNKS_DIR.exists():
         logger.error("Chunks directory not found: %s", CHUNKS_DIR)
         return
 
-    book_dirs = sorted([d for d in CHUNKS_DIR.iterdir() if d.is_dir()])
-    total = len(book_dirs)
-    logger.info("Found %d books to process", total)
+    all_book_dirs = sorted([d for d in CHUNKS_DIR.iterdir() if d.is_dir()])
+    total_books = len(all_book_dirs)
+
+    # ── Apply batching ─────────────────────────────────────────────
+    if args.batch is not None:
+        batch_size = args.batch_size
+        total_batches = math.ceil(total_books / batch_size)
+        batch_num = args.batch
+
+        if batch_num < 1 or batch_num > total_batches:
+            print(f"ERROR: --batch must be between 1 and {total_batches} "
+                  f"(you have {total_books} books, batch-size {batch_size})")
+            return
+
+        start_idx = (batch_num - 1) * batch_size
+        end_idx = min(start_idx + batch_size, total_books)
+        book_dirs = all_book_dirs[start_idx:end_idx]
+
+        print(f"\nBatch {batch_num}/{total_batches}: "
+              f"books {start_idx + 1}–{end_idx} of {total_books}")
+        logger.info("Batch %d/%d: books %d–%d of %d",
+                    batch_num, total_batches, start_idx + 1, end_idx, total_books)
+    else:
+        book_dirs = all_book_dirs
+        print(f"\nProcessing all {total_books} books (no batch selected)")
+
+    logger.info("Starting note generation — output: %s", NOTES_DIR)
 
     success = 0
     skipped = 0
     failed = 0
+    batch_total = len(book_dirs)
 
     for i, book_dir in enumerate(book_dirs, 1):
         metadata = load_metadata(book_dir)
@@ -297,28 +367,29 @@ def main():
         safe_filename = sanitise_note_filename(title)
         note_path = NOTES_DIR / f"{safe_filename}.md"
 
-        # Idempotent: skip if note already exists
         if note_path.exists():
             skipped += 1
             continue
 
-        print(f"[{i}/{total}] {title[:60]}")
+        print(f"[{i}/{batch_total}] {title[:65]}")
 
-        max_words = CLAUDE_MAX_WORDS if use_claude else OLLAMA_MAX_WORDS
-        text = load_book_text(book_dir, max_words)
-        if len(text.strip()) < 100:
-            logger.warning("SKIP (too little text): %s", title)
+        chapters = load_chapters(book_dir, max_words)
+        if not chapters:
+            logger.warning("SKIP (no chapters): %s", title)
             skipped += 1
             continue
 
+        # Inject chapter_count into metadata for the template
+        metadata["chapter_count"] = len(chapters)
+
         try:
             if use_claude:
-                note_content = generate_note_claude(claude_client, metadata, text)
+                note_content = generate_note_claude(claude_client, metadata, chapters)
             else:
-                note_content = generate_note_ollama(metadata, text)
+                note_content = generate_note_ollama(metadata, chapters)
 
             note_path.write_text(note_content, encoding="utf-8")
-            logger.info("OK: %s", title)
+            logger.info("OK (%d chapters): %s", len(chapters), title)
             success += 1
         except Exception as e:
             logger.error("FAIL: %s — %s", title, e)
@@ -327,8 +398,8 @@ def main():
         time.sleep(delay)
 
     logger.info("-" * 60)
-    logger.info("Done. Total: %d | Generated: %d | Skipped: %d | Failed: %d",
-                total, success, skipped, failed)
+    logger.info("Done. Processed: %d | Generated: %d | Skipped: %d | Failed: %d",
+                batch_total, success, skipped, failed)
     print(f"\nDone! Generated: {success} | Skipped: {skipped} | Failed: {failed}")
 
 
