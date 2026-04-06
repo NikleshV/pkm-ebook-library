@@ -82,12 +82,12 @@ def get_text_sample(book_dir: Path) -> str:
     return " ".join(words[:SAMPLE_WORDS])
 
 
-def classify_book(title: str, sample: str) -> str:
+def classify_book(title: str, sample: str, model: str = OLLAMA_MODEL) -> str:
     """Ask Ollama to classify a book. Returns 'fiction' or 'nonfiction'."""
     user_prompt = f"Title: {title}\n\nExcerpt:\n{sample}"
 
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": CLASSIFY_SYSTEM},
             {"role": "user", "content": user_prompt},
@@ -128,14 +128,12 @@ def main():
     )
     args = parser.parse_args()
 
-    global OLLAMA_MODEL
-    if args.model:
-        OLLAMA_MODEL = args.model
+    model = args.model if args.model else OLLAMA_MODEL
 
     logger = setup_logging()
     logger.info("=" * 60)
     logger.info("Starting fiction/non-fiction classification")
-    logger.info("Model: %s", OLLAMA_MODEL)
+    logger.info("Model: %s", model)
 
     # Verify Ollama is running
     try:
@@ -177,7 +175,7 @@ def main():
             continue
 
         try:
-            genre = classify_book(title, sample)
+            genre = classify_book(title, sample, model)
             metadata["genre"] = genre
             save_metadata(book_dir, metadata)
 
