@@ -1,5 +1,6 @@
 # Data directories (large, generated)
 PKM-Index/chunks/
+PKM-Index/chunks_dupes/
 PKM-Index/chroma/
 PKM-Index/logs/
 
@@ -15,6 +16,12 @@ venv/
 .vscode/
 .idea/
 
+# Claude Code internal
+.claude/
+
 # OS
 Thumbs.db
 Desktop.ini
+*.txt.bak
+New Text Document.txt
+Terminal_Run Log*.txt
