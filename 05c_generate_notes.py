@@ -207,16 +207,56 @@ def load_metadata(book_dir: Path) -> dict:
     }
 
 
+MIN_CHAPTER_WORDS = 300     # Chapters shorter than this get batched together
+
+
 def load_chapters(book_dir: Path) -> list[dict]:
-    """Load all chapter .txt files with their full text."""
+    """Load all chapter .txt files, batching short chapters together.
+
+    Short chapters (< MIN_CHAPTER_WORDS words) are merged with their
+    neighbours to reduce total API calls without losing content.
+    """
     txt_files = sorted(book_dir.glob("*.txt"))
-    chapters = []
+    raw = []
     for txt_file in txt_files:
         text = txt_file.read_text(encoding="utf-8", errors="replace").strip()
         if len(text) < 50:
             continue
-        chapters.append({"name": txt_file.stem, "text": text})
-    return chapters
+        raw.append({"name": txt_file.stem, "text": text,
+                    "words": len(text.split())})
+
+    if not raw:
+        return []
+
+    # Batch consecutive short chapters into one entry
+    batched = []
+    buffer_names = []
+    buffer_texts = []
+    buffer_words = 0
+
+    for ch in raw:
+        buffer_names.append(ch["name"])
+        buffer_texts.append(ch["text"])
+        buffer_words += ch["words"]
+
+        # Flush when buffer is large enough or it's a long standalone chapter
+        if buffer_words >= MIN_CHAPTER_WORDS:
+            batched.append({
+                "name": " + ".join(buffer_names) if len(buffer_names) > 1
+                         else buffer_names[0],
+                "text": "\n\n".join(buffer_texts),
+            })
+            buffer_names, buffer_texts, buffer_words = [], [], 0
+
+    # Flush any remaining short tail
+    if buffer_texts:
+        batched.append({
+            "name": " + ".join(buffer_names) if len(buffer_names) > 1
+                     else buffer_names[0],
+            "text": "\n\n".join(buffer_texts),
+        })
+
+    return batched
 
 
 def chunk_text(text: str, max_words: int) -> list[str]:
@@ -329,8 +369,15 @@ def reduce_synthesize(chapter_notes_text: str, metadata: dict,
 
 
 def process_book(book_dir: Path, metadata: dict, logger: logging.Logger,
-                 use_claude: bool = False, claude_client=None) -> str | None:
-    """Full MapReduce pipeline for one book. Returns note content or None."""
+                 use_claude: bool = False, claude_client=None,
+                 start_time: float = None,
+                 time_limit_sec: float = None) -> str | None:
+    """Full MapReduce pipeline for one book. Returns note content or None.
+
+    start_time / time_limit_sec: when provided, the chapter loop will
+    abort early and return a partial fallback note if the time budget
+    is exhausted mid-book.
+    """
     chapters = load_chapters(book_dir)
     if not chapters:
         logger.warning("SKIP (no chapters): %s", metadata.get("title"))
@@ -341,10 +388,20 @@ def process_book(book_dir: Path, metadata: dict, logger: logging.Logger,
     metadata["chapter_count"] = total
 
     # ── Pass 1: Map — notes per chapter ─────────────────────────────────
-    logger.info("  Pass 1: Mapping %d chapters...", total)
+    logger.info("  Pass 1: Mapping %d batched chapter groups...", total)
     chapter_notes = []
 
     for i, chapter in enumerate(chapters, 1):
+        # ── Time-limit check between chapters ─────────────────────────
+        if start_time and time_limit_sec:
+            elapsed = time.time() - start_time
+            if elapsed >= time_limit_sec:
+                logger.info("  TIME LIMIT hit during Pass 1 at ch.%d/%d "
+                            "— saving partial note", i, total)
+                print(f"    ⏰ Time limit hit at chapter {i}/{total} — "
+                      f"saving partial note and stopping.")
+                break
+
         word_count = len(chapter["text"].split())
         n_chunks = math.ceil(word_count / MAX_WORDS_PER_CHAPTER_CALL)
         calls_label = f" ({n_chunks} calls)" if n_chunks > 1 else ""
@@ -520,7 +577,9 @@ def main():
               f"{title[:55]} ({n_chapters} chapters)")
 
         note_content = process_book(book_dir, metadata, logger,
-                                     use_claude, claude_client)
+                                     use_claude, claude_client,
+                                     start_time=start_time,
+                                     time_limit_sec=time_limit_sec)
 
         if note_content:
             note_path.write_text(note_content, encoding="utf-8")
